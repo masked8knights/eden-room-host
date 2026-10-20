@@ -1,0 +1,187 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  EDEN_VERSION: v0.2.1
+  PLAYIT_VERSION: v1.0.10
+
+jobs:
+  linux-appimage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download eden-room and playit binaries
+        run: |
+          mkdir -p bin
+          curl -fL "https://stable.eden-emu.dev/${EDEN_VERSION}/eden-room-x86_64-unknown-linux-musl" -o bin/eden-room
+          curl -fL "https://github.com/playit-cloud/playit-agent/releases/download/${PLAYIT_VERSION}/playit-cli-linux-amd64" -o bin/playit
+          chmod +x bin/eden-room bin/playit
+
+      - name: Build PyInstaller bundle
+        run: |
+          sudo apt-get update && sudo apt-get install -y python3-tk xvfb
+          python3 -m pip install --upgrade pip pyinstaller
+          python3 -c "import tkinter; print('tkinter OK')"
+          python3 -m PyInstaller --onefile --clean --noconfirm \
+            --name EdenRoomHost \
+            --add-binary "bin/eden-room:." \
+            --add-binary "bin/playit:." \
+            --add-binary "assets/icon.png:." \
+            app/eden_room_host.py
+
+      - name: Smoke test the bundle (GUI must survive 12s under Xvfb)
+        run: |
+          xvfb-run -a ./dist/EdenRoomHost & APP_PID=$!
+          sleep 12
+          if kill -0 $APP_PID 2>/dev/null; then
+            echo "GUI runs OK"
+            kill $APP_PID
+          else
+            echo "APP DIED"
+            exit 1
+          fi
+
+      - name: Build AppImage
+        run: |
+          sudo apt-get update && sudo apt-get install -y fuse
+          curl -fL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" -o appimagetool
+          chmod +x appimagetool
+          ./appimagetool --appimage-extract
+          bash packaging/build_appimage.sh
+        env:
+          APPIMAGETOOL: ./squashfs-root/AppRun
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Eden-Room-Host-x86_64.AppImage
+          path: Eden-Room-Host-x86_64.AppImage
+
+  windows-exe:
+    runs-on: windows-latest
+    needs: windows-room-server
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download playit agent
+        shell: pwsh
+        run: |
+          curl.exe -fL "https://github.com/playit-cloud/playit-agent/releases/download/${env:PLAYIT_VERSION}/playit-windows-x86_64.exe" -o playit.exe
+
+      - name: Download eden-room.exe built by the room-server job
+        uses: actions/download-artifact@v4
+        with:
+          name: eden-room-Windows
+          path: .
+        continue-on-error: true
+
+      - name: Build PyInstaller exe
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          $extra = @()
+          if (Test-Path "bin/eden-room.exe") {
+            $extra += @("--add-binary", "bin/eden-room.exe;.")
+          }
+          python -m PyInstaller --onefile --noconsole --clean --noconfirm `
+            --splash assets/icon.png --icon assets/icon.ico --name EdenRoomHost `
+            --add-binary "playit.exe;." `
+            --add-binary "assets/icon.ico;." `
+            --add-binary "assets/icon.png;." `
+            @extra `
+            app/eden_room_host.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Eden-Room-Host-Windows
+          path: dist/EdenRoomHost.exe
+
+  # Optional: build a Windows eden-room.exe from Eden's source. If this
+  # fails the release still ships; Windows users then get the room binary
+  # from Eden's own releases once the project publishes one.
+  windows-room-server:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - name: Clone Eden source
+        shell: bash
+        run: |
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            https://git.eden-emu.dev/eden-emu/eden.git eden
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install glslang
+        shell: pwsh
+        run: |
+          curl.exe -fL "https://github.com/KhronosGroup/glslang/releases/download/main-tot/glslang-main-windows-x86_64-release.zip" -o glslang.zip
+          Expand-Archive glslang.zip -DestinationPath glslang -Force
+          $bin = (Get-ChildItem glslang -Recurse -Filter glslang.exe |
+                  Select-Object -First 1).DirectoryName
+          Copy-Item "$bin\glslang.exe" "$bin\glslangValidator.exe"
+          Add-Content $env:GITHUB_PATH $bin
+
+      - name: Patch upstream MSVC compile error
+        shell: bash
+        run: |
+          sed -i 's/reinterpret_cast<u64>(info->ExceptionRecord/static_cast<u64>(info->ExceptionRecord/' eden/src/common/sparse_large_vector.cpp
+          sed -i 's|/we4505|/wd4505|g; s|/we5245|/wd5245|g' eden/src/CMakeLists.txt
+
+      - name: Configure room-only build
+        shell: pwsh
+        run: |
+          cmake -S eden -B eden/build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DYUZU_ROOM=ON -DYUZU_ROOM_STANDALONE=ON `
+            -DENABLE_QT=OFF -DYUZU_CMD=OFF -DYUZU_TESTS=OFF `
+            -DENABLE_WEB_SERVICE=ON -DENABLE_CUBEB=OFF `
+            -DENABLE_WERROR=OFF `
+            -DCMAKE_CXX_FLAGS="/wd4505"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build eden-room.exe
+        shell: pwsh
+        run: |
+          cmake --build eden/build --target yuzu_room_standalone --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem eden/build -Recurse -Filter eden-room.exe
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem eden/build -Recurse -Filter eden-room.exe |
+                  Select-Object -First 1).FullName
+          $p = Start-Process -FilePath $exe -ArgumentList "--help" -PassThru -NoNewWindow
+          Start-Sleep -Seconds 5
+          if ($p.HasExited -and $p.ExitCode -eq 0) { "help ran OK" }
+          else { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eden-room-Windows
+          path: eden/build/**/eden-room.exe
+
+  release:
+    needs: [linux-appimage, windows-exe, windows-room-server]
+    if: always() && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Attach everything to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/Eden-Room-Host-x86_64.AppImage/Eden-Room-Host-x86_64.AppImage
+            artifacts/Eden-Room-Host-Windows/EdenRoomHost.exe
+            artifacts/eden-room-Windows/**/eden-room.exe
