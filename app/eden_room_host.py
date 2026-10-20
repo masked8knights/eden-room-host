@@ -239,13 +239,33 @@ def start_room(name, password, players, game_title, game_id=None):
     return proc, master
 
 
+# Find the playit systemd unit by scanning unit directories directly instead
+# of asking systemctl, which may not be on PATH when launched from a GUI menu.
+PLAYIT_UNIT = None
+if not IS_WIN:
+    for _d in ("/etc/systemd/system", "/usr/lib/systemd/system"):
+        try:
+            for _f in os.listdir(_d):
+                if _f.startswith("playit") and _f.endswith(".service"):
+                    PLAYIT_UNIT = _f
+                    break
+        except OSError:
+            continue
+        if PLAYIT_UNIT:
+            break
+
+
+def _systemctl(*args):
+    """Run systemctl via an absolute path so GUI launches (sparse PATH) work."""
+    for cmd in ("/usr/bin/systemctl", "/bin/systemctl", "/usr/local/bin/systemctl"):
+        if os.path.exists(cmd):
+            return subprocess.run([cmd, *args], capture_output=True, text=True)
+    return subprocess.run(["systemctl", *args], capture_output=True, text=True)
+
+
 def tunnel_service_exists():
     """Linux only: is a playit systemd unit installed?"""
-    if IS_WIN:
-        return False
-    r = subprocess.run(["systemctl", "list-unit-files", "playit.service"],
-                       capture_output=True, text=True)
-    return "playit.service" in (r.stdout or "")
+    return PLAYIT_UNIT is not None
 
 
 def tunnel_active():
@@ -254,16 +274,35 @@ def tunnel_active():
         r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq playit.exe", "/NH"],
                            capture_output=True, text=True, creationflags=0x08000000)
         return "playit.exe" in (r.stdout or "").lower()
-    r = subprocess.run(["systemctl", "is-active", "playit.service"],
-                       capture_output=True, text=True)
-    return r.stdout.strip() == "active"
+    if PLAYIT_UNIT:
+        r = _systemctl("is-active", PLAYIT_UNIT)
+        return bool(r) and r.stdout.strip() == "active"
+    r = subprocess.run(["pgrep", "-x", "playit"], capture_output=True, text=True)
+    return bool(r.stdout.strip())
 
 
 def tunnel_toggle(on):
     """Linux: start/stop the playit service (polkit rule makes this passwordless)."""
-    subprocess.run(["systemctl", "start" if on else "stop", "playit.service"],
-                   capture_output=True)
+    if not PLAYIT_UNIT:
+        return False
+    _systemctl("start" if on else "stop", PLAYIT_UNIT)
     return tunnel_active()
+
+
+def playit_linked():
+    """Has this machine ever been signed in to playit (a claim exists)?"""
+    if IS_WIN:
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(HOME, "AppData", "Local")
+        paths = [os.path.join(base, "playit", "playit.toml"),
+                 os.path.join(base, "playit-agent", "playit.toml")]
+    else:
+        paths = ["/etc/playit/playit.toml",
+                 "/etc/playit/playit.d",
+                 os.path.join(HOME, ".config", "playit", "playit.toml"),
+                 os.path.join(HOME, ".playit.toml")]
+    return (PLAYIT_UNIT is not None
+            or any(os.path.exists(p) for p in paths)
+            or load_settings().get("playit_claimed", False))
 
 
 class Wizard(tk.Toplevel):
@@ -309,14 +348,13 @@ class Wizard(tk.Toplevel):
             self.row("No playit agent anywhere, get it from playit.gg/download", False)
         btns = tk.Frame(self, background=BG)
         btns.pack(pady=(4, 12))
-        if PLAYIT_BIN and IS_WIN and not self.claim_seen and not tunnel_active():
-            b = ttk.Button(btns, text="Sign in to playit (claim agent)",
+        if PLAYIT_BIN and not playit_linked():
+            b = ttk.Button(btns, text="Sign in to playit (claim agent)" if IS_WIN
+                           else "Run playit to claim this agent",
                            command=self.claim)
             b.pack(side="left", padx=6)
-        elif PLAYIT_BIN and not IS_WIN and not tunnel_service_exists():
-            b = ttk.Button(btns, text="Run playit to claim this agent",
-                           command=self.claim)
-            b.pack(side="left", padx=6)
+        elif PLAYIT_BIN and playit_linked():
+            self.row("playit already signed in on this machine", True)
         ttk.Button(btns, text="Open Eden setup guide",
                    command=lambda: webbrowser.open(
                        "https://eden-emu.dev/")).pack(side="left", padx=6)
@@ -477,8 +515,7 @@ class App(tk.Tk):
         self.columnconfigure(1, weight=1)
         self.refresh_status()
         self.pulse()
-        if not ROOM_BIN or not PLAYIT_BIN or (
-                not tunnel_active() and not self.settings.get("playit_claimed")):
+        if not ROOM_BIN or not PLAYIT_BIN or not playit_linked():
             self.after(400, lambda: Wizard(self))
 
     # ---- logging -------------------------------------------------------
