@@ -26,6 +26,16 @@ CLAIM_RE = re.compile(r"https://playit\.gg/claim/[A-Za-z0-9\-]+")
 
 HOME = os.path.expanduser("~")
 
+# PyInstaller's onefile runtime points LD_LIBRARY_PATH at the extracted
+# bundle, which breaks system binaries started from the app (systemctl
+# fails to load the system's libcrypto). Strip those vars when spawning
+# external system tools.
+_CLEAN_ENV = {k: v for k, v in os.environ.items()
+              if k not in ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONHOME",
+                           "PYTHONPATH", "GDK_PIXBUF_MODULE_FILE",
+                           "GIO_MODULE_DIR", "GTK_PATH", "GTK_EXE_PREFIX",
+                           "GSETTINGS_SCHEMA_DIR")}
+
 
 def app_dir():
     """Folder holding bundled binaries (exe/AppImage data or source dir)."""
@@ -166,17 +176,18 @@ if IS_WIN:
         """True when a live eden-room.exe process exists."""
         r = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq eden-room.exe", "/NH"],
-            capture_output=True, text=True, creationflags=0x08000000)
+            capture_output=True, text=True, creationflags=0x08000000,
+                           env=_CLEAN_ENV)
         return "eden-room.exe" in (r.stdout or "").lower()
 
     def stop_room():
-        subprocess.run(["taskkill", "/F", "/T", "/IM", "eden-room.exe"],
+        subprocess.run(["taskkill", "/F", "/T", "/IM", "eden-room.exe"], env=_CLEAN_ENV,
                        capture_output=True, creationflags=0x08000000)
 else:
     def room_running():
         """True when a live (non-zombie) room server process exists."""
         for name in ("eden-room", "eden-room-x86_6"):
-            r = subprocess.run(["pgrep", "-x", name], capture_output=True, text=True)
+            r = subprocess.run(["pgrep", "-x", name], capture_output=True, text=True, env=_CLEAN_ENV)
             for pid in r.stdout.split():
                 try:
                     with open(f"/proc/{pid}/stat") as f:
@@ -189,7 +200,7 @@ else:
     def stop_room():
         """Kill every live room server (TERM is ignored by eden-room, use KILL)."""
         for name in ("eden-room", "eden-room-x86_6"):
-            subprocess.run(["pkill", "-9", "-x", name], capture_output=True)
+            subprocess.run(["pkill", "-9", "-x", name], capture_output=True, env=_CLEAN_ENV)
 
 
 def wait_port_free(timeout=3.0):
@@ -259,8 +270,8 @@ def _systemctl(*args):
     """Run systemctl via an absolute path so GUI launches (sparse PATH) work."""
     for cmd in ("/usr/bin/systemctl", "/bin/systemctl", "/usr/local/bin/systemctl"):
         if os.path.exists(cmd):
-            return subprocess.run([cmd, *args], capture_output=True, text=True)
-    return subprocess.run(["systemctl", *args], capture_output=True, text=True)
+            return subprocess.run([cmd, *args], capture_output=True, text=True, env=_CLEAN_ENV)
+    return subprocess.run(["systemctl", *args], capture_output=True, text=True, env=_CLEAN_ENV)
 
 
 def tunnel_service_exists():
@@ -277,7 +288,7 @@ def tunnel_active():
     if PLAYIT_UNIT:
         r = _systemctl("is-active", PLAYIT_UNIT)
         return bool(r) and r.stdout.strip() == "active"
-    r = subprocess.run(["pgrep", "-x", "playit"], capture_output=True, text=True)
+    r = subprocess.run(["pgrep", "-x", "playit"], capture_output=True, text=True, env=_CLEAN_ENV)
     return bool(r.stdout.strip())
 
 
@@ -622,7 +633,7 @@ class App(tk.Tk):
                     subprocess.run(["taskkill", "/F", "/T", "/IM", "playit.exe"],
                                    capture_output=True, creationflags=0x08000000)
                 else:
-                    subprocess.run(["pkill", "-9", "-x", "playit"], capture_output=True)
+                    subprocess.run(["pkill", "-9", "-x", "playit"], capture_output=True, env=_CLEAN_ENV)
                 self.tunnel_proc = None
                 self.emit(f"Tunnel turned off at {time.strftime('%H:%M:%S')}")
             else:
